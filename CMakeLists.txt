@@ -46,6 +46,26 @@ endif()
 add_executable(uno src/main.cpp src/app.cpp src/online.cpp)
 target_link_libraries(uno PRIVATE uno_core)
 
+# Link the compiler runtime statically so the shipped binary depends only on
+# Windows system DLLs (or nothing at all on Linux) and runs on a machine that
+# has no MinGW or MSVC redistributable installed.
+option(TUIUNO_STATIC_RUNTIME "Link the compiler runtime statically" OFF)
+if(TUIUNO_STATIC_RUNTIME)
+  if(MSVC)
+    message(WARNING "TUIUNO_STATIC_RUNTIME needs MSVC: set /MT (CMAKE_MSVC_RUNTIME_LIBRARY)")
+  else()
+    include(CheckCXXSourceCompiles)
+    set(CMAKE_REQUIRED_LINK_OPTIONS -static)
+    check_cxx_source_compiles("int main() { return 0; }" TUIUNO_HAVE_STATIC_LINK)
+    unset(CMAKE_REQUIRED_LINK_OPTIONS)
+    if(TUIUNO_HAVE_STATIC_LINK)
+      target_link_options(uno PRIVATE -static)
+    else()
+      target_link_options(uno PRIVATE -static-libgcc -static-libstdc++)
+    endif()
+  endif()
+endif()
+
 enable_testing()
 add_executable(uno_tests tests/test_uno.cpp)
 target_link_libraries(uno_tests PRIVATE uno_core)
