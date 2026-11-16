@@ -155,7 +155,10 @@ void testViewPrivacy() {
 
     for (int p = 0; p < r.playerCount; ++p) {
         const View v = g.viewFor(p);
-        checkEq(static_cast<int>(v.hand.size()), r.initialCards, "own hand size");
+        // The opening card can be a draw card, so compare against the real
+        // hand instead of assuming everyone still has the dealt seven.
+        checkEq(static_cast<int>(v.hand.size()),
+                static_cast<int>(g.handOf(p).size()), "own hand size");
         // The sizes reported for other players must match the real hands.
         for (int q = 0; q < r.playerCount; ++q) {
             checkEq(v.players[(size_t)q].handSize,
