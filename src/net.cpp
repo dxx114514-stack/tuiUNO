@@ -50,6 +50,14 @@ void shutdownBoth(RawSocket s) {
 #endif
 }
 
+void closeRaw(RawSocket s) {
+#if UNO_WIN
+    ::closesocket(s);
+#else
+    ::close(s);
+#endif
+}
+
 }  // namespace
 
 void init() {
@@ -77,16 +85,16 @@ bool listenOn(Socket& out, const std::string& bindAddr, uint16_t port, int backl
     if (bindAddr.empty() || bindAddr == "0.0.0.0" || bindAddr == "*") {
         addr.sin_addr.s_addr = htonl(INADDR_ANY);
     } else if (::inet_pton(AF_INET, bindAddr.c_str(), &addr.sin_addr) != 1) {
-        ::closesocket(s);
+        closeRaw(s);
         return false;
     }
 
     if (::bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        ::closesocket(s);
+        closeRaw(s);
         return false;
     }
     if (::listen(s, backlog) != 0) {
-        ::closesocket(s);
+        closeRaw(s);
         return false;
     }
     setNonBlocking(s);
@@ -129,7 +137,7 @@ bool connectTo(const std::string& host, uint16_t port, Socket& out, std::string*
     const int rc = ::connect(s, res->ai_addr, static_cast<SockLen>(res->ai_addrlen));
     ::freeaddrinfo(res);
     if (rc != 0) {
-        ::closesocket(s);
+        closeRaw(s);
         if (err) *err = "connection refused or host unreachable";
         return false;
     }

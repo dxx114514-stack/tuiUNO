@@ -46,8 +46,6 @@ class MatchSession {
   private:
     void broadcast(const UpdateSink& sink);
 
-    Rules rules_;
-    uint32_t seed_;
     Game game_;
     std::vector<std::unique_ptr<Controller>> controllers_;
     std::vector<bool> connected_;

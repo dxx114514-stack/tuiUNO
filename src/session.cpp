@@ -2,8 +2,7 @@
 
 namespace uno {
 
-MatchSession::MatchSession(Rules rules, uint32_t seed)
-    : rules_(rules), seed_(seed), game_(rules, seed) {}
+MatchSession::MatchSession(Rules rules, uint32_t seed) : game_(rules, seed) {}
 
 void MatchSession::addController(std::unique_ptr<Controller> c) {
     if (!c) return;
