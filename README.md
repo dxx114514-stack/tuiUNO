@@ -1,5 +1,7 @@
 # tuiUNO
 
+[![CI](https://github.com/dxx114514-stack/tuiUNO/actions/workflows/ci.yml/badge.svg)](https://github.com/dxx114514-stack/tuiUNO/actions/workflows/ci.yml)
+
 A UNO game for the terminal, written in C++17 with no third-party dependencies.
 
 - **Offline PVE** — 1 or 2 humans against CPU opponents, three AI difficulties.
@@ -27,6 +29,9 @@ This produces `build/uno` (the game) and `build/uno_tests` (the test suite).
 ctest --test-dir build --output-on-failure   # run the tests
 ./build/uno_tests                            # same, but verbose
 ```
+
+CI builds and runs the suite on Linux (GCC and Clang), macOS (Clang) and Windows
+(MSVC) for every push and pull request.
 
 ## Play
 

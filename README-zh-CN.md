@@ -1,5 +1,7 @@
 # tuiUNO
 
+[![CI](https://github.com/dxx114514-stack/tuiUNO/actions/workflows/ci.yml/badge.svg)](https://github.com/dxx114514-stack/tuiUNO/actions/workflows/ci.yml)
+
 一款用 C++17 编写的命令行 UNO 游戏，不依赖任何第三方库。
 
 - **离线人机对战（PVE）** — 1 名或 2 名玩家对战电脑，三档 AI 难度。
@@ -27,6 +29,9 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure   # 运行测试
 ./build/uno_tests                            # 同上，但输出更详细
 ```
+
+CI 会在每次 push 和 pull request 时，于 Linux（GCC、Clang）、macOS（Clang）和
+Windows（MSVC）上编译并运行测试。
 
 ## 运行
 
