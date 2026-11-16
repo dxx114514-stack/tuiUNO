@@ -116,6 +116,9 @@ class Game {
 
     void setName(int seat, const std::string& name);
     void start();
+    // Ends the match because `player` left: current scores are kept and the
+    // quitter is placed last in the final standings.
+    void forfeit(int player);
 
     // Applies an action on behalf of `player`. Returns false and appends a
     // Rejected event when the action is illegal; state stays untouched.

@@ -33,16 +33,73 @@ const char* colorAnsi(Color c) {
 
 const char* kindColor(Color c) { return colorAnsi(c); }
 
+// Terminal column width of one Unicode code point. This is a compact wcwidth:
+// combining marks and controls are zero columns, CJK/fullwidth/emoji are two.
+int codepointWidth(uint32_t cp) {
+    if (cp == 0) return 0;
+    if (cp < 0x20 || (cp >= 0x7f && cp < 0xa0)) return 0;
+    if ((cp >= 0x0300 && cp <= 0x036f) || (cp >= 0x1ab0 && cp <= 0x1aff) ||
+        (cp >= 0x1dc0 && cp <= 0x1dff) || (cp >= 0x20d0 && cp <= 0x20ff) ||
+        (cp >= 0xfe00 && cp <= 0xfe0f) || (cp >= 0xfe20 && cp <= 0xfe2f) ||
+        cp == 0x200b || cp == 0x200c || cp == 0x200d || cp == 0xfeff) {
+        return 0;
+    }
+    if ((cp >= 0x1100 && cp <= 0x115f) || cp == 0x2329 || cp == 0x232a ||
+        (cp >= 0x2e80 && cp <= 0xa4cf && cp != 0x303f) ||
+        (cp >= 0xac00 && cp <= 0xd7a3) || (cp >= 0xf900 && cp <= 0xfaff) ||
+        (cp >= 0xfe10 && cp <= 0xfe19) || (cp >= 0xfe30 && cp <= 0xfe6f) ||
+        (cp >= 0xff00 && cp <= 0xff60) || (cp >= 0xffe0 && cp <= 0xffe6) ||
+        (cp >= 0x1f300 && cp <= 0x1f64f) || (cp >= 0x1f900 && cp <= 0x1f9ff) ||
+        (cp >= 0x20000 && cp <= 0x3fffd)) {
+        return 2;
+    }
+    return 1;
+}
+
 int displayWidth(const std::string& s) {
-    // Good enough for our strings: count UTF-8 code points, ignore ANSI.
     int n = 0;
-    for (size_t i = 0; i < s.size(); ++i) {
+    size_t i = 0;
+    while (i < s.size()) {
         const unsigned char c = static_cast<unsigned char>(s[i]);
         if (c == 0x1b) {
-            while (i < s.size() && s[i] != 'm') ++i;
+            // Recognised ANSI escape: CSI (ESC [ ... final byte). Anything else
+            // is a lone control and contributes no columns.
+            if (i + 1 < s.size() && s[i + 1] == '[') {
+                i += 2;
+                while (i < s.size()) {
+                    const unsigned char f = static_cast<unsigned char>(s[i++]);
+                    if (f >= 0x40 && f <= 0x7e) break;
+                }
+            } else {
+                ++i;
+            }
             continue;
         }
-        if ((c & 0xc0) != 0x80) ++n;
+
+        uint32_t cp = c;
+        size_t width = 1;
+        if ((c & 0x80) == 0) {
+            cp = c;
+        } else if ((c & 0xe0) == 0xc0 && i + 1 < s.size()) {
+            cp = ((c & 0x1fu) << 6) | (static_cast<unsigned char>(s[i + 1]) & 0x3fu);
+            width = 2;
+        } else if ((c & 0xf0) == 0xe0 && i + 2 < s.size()) {
+            cp = ((c & 0x0fu) << 12) |
+                 ((static_cast<unsigned char>(s[i + 1]) & 0x3fu) << 6) |
+                 (static_cast<unsigned char>(s[i + 2]) & 0x3fu);
+            width = 3;
+        } else if ((c & 0xf8) == 0xf0 && i + 3 < s.size()) {
+            cp = ((c & 0x07u) << 18) |
+                 ((static_cast<unsigned char>(s[i + 1]) & 0x3fu) << 12) |
+                 ((static_cast<unsigned char>(s[i + 2]) & 0x3fu) << 6) |
+                 (static_cast<unsigned char>(s[i + 3]) & 0x3fu);
+            width = 4;
+        } else if ((c & 0xc0) == 0x80) {
+            // Stray continuation byte: invalid input, no visible cell.
+            cp = 0;
+        }
+        n += codepointWidth(cp);
+        i += width;
     }
     return n;
 }

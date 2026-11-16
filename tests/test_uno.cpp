@@ -11,6 +11,7 @@
 #include "uno/deck.hpp"
 #include "uno/game.hpp"
 #include "uno/i18n.hpp"
+#include "uno/net.hpp"
 #include "uno/protocol.hpp"
 #include "uno/rules.hpp"
 #include "uno/serialize.hpp"
@@ -722,7 +723,8 @@ void testProtocolFraming() {
 
     const std::string frame = proto::encode(proto::MsgType::Action, proto::makeAction(a));
     proto::FrameDecoder dec;
-    // Feed one byte at a time to prove the decoder is resynchronisable.
+    // Feed one byte at a time to prove partial delivery is buffered correctly.
+    // (This cannot resynchronise a stream that is already misaligned.)
     for (size_t i = 0; i < frame.size(); ++i) dec.feed(frame.substr(i, 1));
     proto::Message m;
     check(dec.next(m), "a frame came out");
@@ -757,6 +759,19 @@ void testProtocolFraming() {
     checkEq(static_cast<int>(m.payload.size()), 4, "payload length");
     check(m.payload == "abcd", "payload bytes");
 
+    // A desynchronised stream can turn arbitrary bytes into a length prefix.
+    // Anything above the frame cap must fail closed instead of buffering 4 GB.
+    proto::FrameDecoder dec4;
+    std::string evil;
+    evil.push_back(0x05);  // MsgType::Action
+    evil.push_back(0xff);  // length = 0xFFFFFFFF
+    evil.push_back(0xff);
+    evil.push_back(0xff);
+    evil.push_back(0xff);
+    dec4.feed(evil);
+    check(!dec4.next(m), "oversized frame is refused");
+    check(dec4.failed(), "decoder reports the protocol failure");
+
     proto::RoomConfig cfg;
     cfg.rules = defaultRules();
     cfg.name = "tester";
@@ -765,6 +780,93 @@ void testProtocolFraming() {
     check(proto::parseCreateRoom(proto::makeCreateRoom(cfg), out), "room config round trip");
     check(out.rules == cfg.rules, "rules survive");
     check(out.name == "tester" && out.seed == 99, "fields survive");
+}
+
+void testRoomCodeValidation() {
+    Case c("room code validation");
+    const std::string expected = "K49K";
+    check(proto::checkJoin(expected, "K49K", false) == proto::JoinCheck::Ok,
+          "correct code accepted");
+    check(proto::checkJoin(expected, "WRONG", false) == proto::JoinCheck::BadRoom,
+          "wrong code rejected");
+    check(proto::checkJoin(expected, "", false) == proto::JoinCheck::BadRoom,
+          "missing code rejected");
+    check(proto::checkJoin("", "anything", false) == proto::JoinCheck::Ok,
+          "a room without a code does not require one");
+    check(proto::checkJoin(expected, "K49K", true) == proto::JoinCheck::InProgress,
+          "late join refused");
+
+    // Round-trip the actual wire message, then run the host's gate on it.
+    std::string code, name;
+    uint8_t lang = 0;
+    check(proto::parseJoinRoom(proto::makeJoinRoom("NOPE", "eve", 0), code, name, lang),
+          "join request decodes");
+    check(proto::checkJoin(expected, code, false) == proto::JoinCheck::BadRoom,
+          "wire code mismatch rejected");
+}
+
+void testOutboundBuffering() {
+    Case c("outbound frames are buffered or fail closed");
+    Action a;
+    a.type = ActType::Draw;
+    const std::string frame = proto::encode(proto::MsgType::Action, proto::makeAction(a));
+
+    net::OutBuf out;
+    check(out.push(frame), "frame queued");
+    // A full socket buffer accepts only two bytes, then would block; the frame
+    // must stay queued rather than being truncated on the wire.
+    std::string wire;
+    bool first = true;
+    bool ok = out.flushWith([&](const char* data, size_t n) {
+        if (first) {
+            first = false;
+            const size_t take = n < 2 ? n : 2;
+            wire.append(data, take);
+            return static_cast<long long>(take);
+        }
+        return 0LL;
+    });
+    check(ok, "short write keeps the connection alive");
+    checkEq(static_cast<int>(out.size()), static_cast<int>(frame.size()) - 2,
+            "unwritten bytes stay buffered");
+    ok = out.flushWith([&](const char* data, size_t n) {
+        wire.append(data, n);
+        return static_cast<long long>(n);
+    });
+    check(ok, "the rest of the frame flushes later");
+    check(out.empty(), "nothing is left behind");
+    check(wire == frame, "the wire receives exactly one intact frame");
+
+    // A fatal write must discard the queue and tell the caller to close, so a
+    // poisoned stream is never reused.
+    check(out.push(frame), "frame queued again");
+    ok = out.flushWith([](const char*, size_t) { return -1LL; });
+    check(!ok, "fatal write fails closed");
+    check(out.empty(), "failed buffer is discarded");
+
+    net::OutBuf small(8);
+    check(!small.push(std::string(16, 'x')), "oversized backlog is refused");
+}
+
+void testInputSanitization() {
+    Case c("untrusted text is sanitised");
+    const std::string attack = "\x1b[2J\x1b[H" "hi\r\nthere\x7f";
+    check(proto::sanitizeText(attack, 32) == "hithere", "control bytes are stripped");
+
+    const std::string cn = "\xe4\xb8\xad\xe6\x96\x87";  // 中文
+    check(proto::sanitizeText(cn, 1) == "\xe4\xb8\xad",
+          "code-point truncation keeps UTF-8 intact");
+    checkEq(static_cast<int>(proto::truncateUtf8(cn, 4).size()), 3,
+            "byte truncation does not split a code point");
+    checkEq(static_cast<int>(proto::sanitizeText(std::string(32, 'x'), 16).size()), 16,
+            "names are capped at 16 code points");
+
+    const std::string longChat(500, 'x');
+    checkEq(static_cast<int>(
+                proto::truncateUtf8(proto::sanitizeText(longChat, 1000),
+                                    proto::kMaxChatBytes)
+                    .size()),
+            static_cast<int>(proto::kMaxChatBytes), "chat is capped at 200 bytes");
 }
 
 void testI18n() {
@@ -841,6 +943,39 @@ void testRulePresets() {
     check(t.teamPlay(), "teams active at four players");
 }
 
+void testForfeitKeepsScores() {
+    Case c("quitting is a scored forfeit");
+    Rules r = defaultRules();
+    r.playerCount = 4;
+    Game g(r, 321);
+    for (int p = 0; p < r.playerCount; ++p) g.setName(p, "P" + S(p + 1));
+    g.start();
+
+    g.forfeit(2);
+    const View v = g.viewFor(0);
+    check(v.matchOver, "the match ends when a player quits");
+    checkEq(static_cast<int>(v.finalRank.size()), r.playerCount, "everyone is ranked");
+    check(!v.finalRank.empty() && v.finalRank.back() == 2, "the quitter is ranked last");
+    check(totalCards(g, r) == 108, "cards are still conserved");
+
+    struct QuitController : Controller {
+        std::string name() const override { return "quitter"; }
+        Action awaitAction(const View&) override { return Action{}; }
+    };
+
+    Rules two = defaultRules();
+    two.playerCount = 2;
+    MatchSession ms(two, 77);
+    ms.addController(std::make_unique<QuitController>());
+    ms.addController(std::make_unique<BotController>("CPU", Difficulty::Easy, 78, 1));
+    ms.startGame();
+    const SessionResult res = ms.run(nullptr, nullptr);
+    check(res == SessionResult::Quit, "the session reports a quit, not an abort");
+    check(ms.game().matchOver(), "the forfeit produces a result");
+    checkEq(static_cast<int>(ms.game().viewFor(0).finalRank.size()), 2,
+            "the forfeit publishes standings");
+}
+
 // Renders a real board for every seat. This exercises the whole drawing path
 // (cards, colours, wrapping, log) without needing a keyboard.
 void testUiRendering() {
@@ -873,6 +1008,13 @@ void testUiRendering() {
     // centring only adds the left margin; the right side stays unpadded
     checkEq(static_cast<int>(visibleWidth(centerTo("abc", 9))), 6, "centerTo adds a margin");
     checkEq(static_cast<int>(visibleWidth(centerTo("abc", 1))), 3, "centerTo never truncates");
+
+    // CJK glyphs occupy two terminal columns, not one.
+    const std::string cjk = "\xe4\xb8\xad\xe6\x96\x87";  // 中文
+    checkEq(visibleWidth(cjk), 4, "CJK text is two columns per glyph");
+    checkEq(static_cast<int>(visibleWidth(padTo(cjk, 6))), 6, "padTo accounts for CJK width");
+    checkEq(static_cast<int>(visibleWidth(centerTo(cjk, 8))), 6,
+            "centerTo accounts for CJK width");
 
     consoleReset();
 }
@@ -909,8 +1051,12 @@ int main() {
     testBotAlwaysLegal();
     testSerializationRoundTrip();
     testProtocolFraming();
+    testRoomCodeValidation();
+    testOutboundBuffering();
+    testInputSanitization();
     testI18n();
     testRulePresets();
+    testForfeitKeepsScores();
     testUiRendering();
     testMenuItems();
 

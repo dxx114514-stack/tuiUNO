@@ -184,6 +184,14 @@ Every socket is non-blocking and the whole thing runs on one thread, so the host
 can also play its own seat while serving the others. A remote player who goes
 quiet for 30 seconds is played for, rather than stalling the table.
 
+A connection must join the room within five seconds or its seat is released, and
+the room code is checked before that seat is handed out. Inbound nicknames and
+chat are stripped of control bytes (including ANSI escapes) and length-capped.
+Outbound frames are queued whole per peer: a slow reader delays later frames but
+can never split one, and a peer that falls too far behind is disconnected. Frame
+lengths are capped as well, so a desynchronised stream cannot turn into a memory
+DoS.
+
 ## Tests
 
 `tests/test_uno.cpp` runs about eleven million assertions in about a second and
@@ -195,9 +203,12 @@ covers:
 - complete matches at every difficulty and seat count, asserting that all 108
   cards stay accounted for and that no bot ever submits an illegal action
 - `View` round-tripping through the wire format, including per-player privacy
-- frame decoding, including byte-at-a-time delivery and truncated frames
-- rendering the real board for every seat, and i18n coverage that fails if any
-  message is ever rendered with an unfilled `{}` placeholder
+- frame decoding, including byte-at-a-time delivery, truncated frames, and
+  oversized length prefixes that must be rejected
+- room-code validation (a wrong code must be rejected), outbound buffering that
+  never splits a frame, and sanitisation of control bytes in nicknames/chat
+- rendering the real board for every seat, CJK column widths, and i18n coverage
+  that fails if any message is ever rendered with an unfilled `{}` placeholder
 
 ## Licence
 

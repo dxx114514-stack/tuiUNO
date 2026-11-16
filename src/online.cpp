@@ -23,6 +23,17 @@ namespace {
 constexpr uint16_t kDefaultPort = 45231;
 // How long an unattended host (no console on stdin) waits for remote players.
 constexpr int kUnattendedGraceMs = 12000;
+// A socket that has not completed a JoinRoom by then gives its seat back.
+constexpr int kJoinTimeoutMs = 5000;
+
+std::string cleanName(const std::string& raw) {
+    return proto::sanitizeText(raw, proto::kMaxNameCodepoints);
+}
+
+std::string cleanChat(const std::string& raw) {
+    return proto::truncateUtf8(
+        proto::sanitizeText(raw, proto::kMaxChatBytes), proto::kMaxChatBytes);
+}
 
 const char* kR = "\x1b[0m";
 const char* kBold = "\x1b[1m";
@@ -67,10 +78,13 @@ struct Peer {
     int seat = -1;
     std::string name;
     std::string inBuf;
+    net::OutBuf outBuf;
     proto::FrameDecoder decoder;
     std::deque<Action> actions;
     std::vector<std::string> chat;
     uint8_t lang = 0;
+    bool joined = false;
+    std::chrono::steady_clock::time_point connectedAt{};
 };
 
 struct Room {
@@ -110,12 +124,26 @@ struct Room {
     }
 
     // -- io ---------------------------------------------------------------
+    // Every frame is queued whole and flushed opportunistically. A would-block
+    // leaves the remainder queued for the next pump(), so the stream can never
+    // contain a half frame; a fatal error closes the peer (fail-closed).
+    void flushPeer(int seat) {
+        if (seat < 0 || seat >= static_cast<int>(peers.size())) return;
+        Peer& p = peers[(size_t)seat];
+        if (p.sock == net::kInvalidSocket) return;
+        if (!p.outBuf.flush(p.sock)) closePeer(seat);
+    }
+
     void send(int seat, proto::MsgType t, const std::string& payload) {
         if (seat < 0 || seat >= static_cast<int>(peers.size())) return;
         Peer& p = peers[(size_t)seat];
         if (p.sock == net::kInvalidSocket) return;
         const std::string frame = proto::encode(t, payload);
-        net::sendRaw(p.sock, frame.data(), frame.size());
+        if (!p.outBuf.push(frame)) {
+            closePeer(seat);
+            return;
+        }
+        flushPeer(seat);
     }
 
     void sendAll(proto::MsgType t, const std::string& payload, int skipSeat = -1) {
@@ -171,13 +199,29 @@ struct Room {
             p.sock = s;
             p.seat = seat;
             p.inBuf.clear();
+            p.outBuf.clear();
             p.decoder = proto::FrameDecoder();
             p.actions.clear();
+            p.joined = false;
+            p.connectedAt = std::chrono::steady_clock::now();
         }
 
+        const auto now = std::chrono::steady_clock::now();
         for (int i = 1; i < rules.playerCount; ++i) {
             Peer& p = peers[(size_t)i];
             if (p.sock == net::kInvalidSocket) continue;
+
+            // Resume any frame that was left behind by a full send buffer.
+            flushPeer(i);
+            if (p.sock == net::kInvalidSocket) continue;
+
+            // A silent connection must not hold a seat indefinitely.
+            if (!p.joined &&
+                now - p.connectedAt > std::chrono::milliseconds(kJoinTimeoutMs)) {
+                closePeer(i);
+                continue;
+            }
+
             if (!net::recvRaw(p.sock, p.inBuf)) {
                 closePeer(i);
                 continue;
@@ -188,7 +232,8 @@ struct Room {
             }
             proto::Message m;
             while (p.decoder.next(m)) handle(i, m);
-            if (peers[(size_t)i].sock == net::kInvalidSocket) break;
+            if (p.sock == net::kInvalidSocket) continue;
+            if (p.decoder.failed()) closePeer(i);
         }
     }
 
@@ -197,7 +242,9 @@ struct Room {
         if (p.sock == net::kInvalidSocket) return;
         net::closeSocket(p.sock);
         p.sock = net::kInvalidSocket;
+        p.outBuf.clear();
         p.actions.clear();
+        p.joined = false;
         if (started) {
             // Their seat falls back to a CPU so the match keeps running.
             bot[(size_t)seat] = true;
@@ -211,38 +258,44 @@ struct Room {
             case proto::MsgType::Hello: {
                 std::string name;
                 uint8_t lang = 0;
-                if (proto::parseHello(m.payload, name, lang) && name.size() < 24) {
-                    p.name = name;
-                    p.lang = lang;
-                    names[(size_t)seat] = name;
+                if (proto::parseHello(m.payload, name, lang)) {
+                    name = cleanName(name);
+                    if (!name.empty()) {
+                        p.name = name;
+                        p.lang = lang;
+                        names[(size_t)seat] = name;
+                    }
                 }
                 break;
             }
             case proto::MsgType::JoinRoom: {
-                std::string code, name;
+                std::string joinCode, name;
                 uint8_t lang = 0;
-                if (!proto::parseJoinRoom(m.payload, code, name, lang)) break;
-                if (!code.empty() && code != code) {
-                    send(seat, proto::MsgType::Error,
-                         proto::makeError("bad_room", "wrong room code"));
-                    closePeer(seat);
-                    return;
+                if (!proto::parseJoinRoom(m.payload, joinCode, name, lang)) break;
+                switch (proto::checkJoin(code, joinCode, started)) {
+                    case proto::JoinCheck::BadRoom:
+                        send(seat, proto::MsgType::Error,
+                             proto::makeError("bad_room", "wrong room code"));
+                        closePeer(seat);
+                        return;
+                    case proto::JoinCheck::InProgress:
+                        // Seats are fixed once the match is running; a late
+                        // joiner is told so rather than being left waiting for
+                        // a turn that will never come.
+                        send(seat, proto::MsgType::Error,
+                             proto::makeError("in_progress", tr("pvp.already_started")));
+                        closePeer(seat);
+                        return;
+                    case proto::JoinCheck::Ok:
+                        break;
                 }
-                if (started) {
-                    // Seats are fixed once the match is running; a late joiner
-                    // is told so rather than being left waiting for a turn that
-                    // will never come.
-                    send(seat, proto::MsgType::Error,
-                         proto::makeError("in_progress", tr("pvp.already_started")));
-                    closePeer(seat);
-                    return;
-                }
-                if (name.size() < 24) {
-                    p.name = name;
-                    p.lang = lang;
-                    names[(size_t)seat] = name;
-                    bot[(size_t)seat] = false;
-                }
+                name = cleanName(name);
+                if (name.empty()) name = "player" + S(seat + 1);
+                p.name = name;
+                p.lang = lang;
+                p.joined = true;
+                names[(size_t)seat] = name;
+                bot[(size_t)seat] = false;
                 send(seat, proto::MsgType::Welcome,
                      proto::makeWelcome(seat, names[(size_t)seat], code, seat == 0));
                 sendLobby();
@@ -257,11 +310,12 @@ struct Room {
             }
             case proto::MsgType::Chat: {
                 std::string from, text;
-                if (proto::parseChat(m.payload, from, text) && !text.empty()) {
-                    if (lobbyChat.size() > 20) lobbyChat.erase(lobbyChat.begin());
-                    lobbyChat.push_back("<" + names[(size_t)seat] + "> " + text);
-                    sendChat(names[(size_t)seat], text);
-                }
+                if (!proto::parseChat(m.payload, from, text)) break;
+                text = cleanChat(text);
+                if (text.empty()) break;
+                while (lobbyChat.size() >= 20) lobbyChat.erase(lobbyChat.begin());
+                lobbyChat.push_back("<" + names[(size_t)seat] + "> " + text);
+                sendChat(names[(size_t)seat], text);
                 break;
             }
             case proto::MsgType::Leave:
@@ -361,8 +415,9 @@ void hostLobby(Room& room, GameUI& ui) {
             return;
         }
         if (k.isChar('/')) {
-            const std::string text = readLine("");
+            const std::string text = cleanChat(readLine(""));
             if (!text.empty()) {
+                while (room.lobbyChat.size() >= 20) room.lobbyChat.erase(room.lobbyChat.begin());
                 room.lobbyChat.push_back("<" + room.names[0] + "> " + text);
                 room.sendChat(room.names[0], text);
             }
@@ -431,6 +486,7 @@ void runHostedMatch(Room& room, GameUI& ui) {
 struct Client {
     net::Socket sock = net::kInvalidSocket;
     std::string inBuf;
+    net::OutBuf outBuf;
     proto::FrameDecoder decoder;
     int seat = -1;
     std::string roomCode;
@@ -441,14 +497,25 @@ struct Client {
     bool matchOver = false;
     std::vector<std::string> chat;
 
+    void flush() {
+        if (sock == net::kInvalidSocket) return;
+        if (!outBuf.flush(sock)) close();
+    }
+
     void send(proto::MsgType t, const std::string& payload) {
         if (sock == net::kInvalidSocket) return;
         const std::string frame = proto::encode(t, payload);
-        net::sendRaw(sock, frame.data(), frame.size());
+        if (!outBuf.push(frame)) {
+            close();
+            return;
+        }
+        flush();
     }
 
     // Non-blocking read; recv tells us when nothing more is available.
     void pump() {
+        if (sock == net::kInvalidSocket) return;
+        flush();
         if (sock == net::kInvalidSocket) return;
         for (;;) {
             const size_t before = inBuf.size();
@@ -462,8 +529,12 @@ struct Client {
                 inBuf.clear();
             }
             proto::Message m;
-            while (decoder.next(m)) handle(m);
+            while (sock != net::kInvalidSocket && decoder.next(m)) handle(m);
             if (sock == net::kInvalidSocket) return;
+            if (decoder.failed()) {
+                close();
+                return;
+            }
         }
     }
 
@@ -472,6 +543,7 @@ struct Client {
             net::closeSocket(sock);
             sock = net::kInvalidSocket;
         }
+        outBuf.clear();
     }
 
     void handle(const proto::Message& m) {
@@ -488,6 +560,11 @@ struct Client {
             }
             case proto::MsgType::View: {
                 if (proto::parseView(m.payload, view)) {
+                    // Defence in depth: never render control bytes, even if a
+                    // (malicious or buggy) host put them in a snapshot.
+                    for (PlayerInfo& pi : view.players) {
+                        pi.name = proto::sanitizeText(pi.name, proto::kMaxNameCodepoints);
+                    }
                     haveView = true;
                     if (view.matchOver) matchOver = true;
                 }
@@ -495,12 +572,20 @@ struct Client {
             }
             case proto::MsgType::ChatMsg: {
                 std::string from, text;
-                if (proto::parseChat(m.payload, from, text)) chat.push_back("<" + from + "> " + text);
+                if (proto::parseChat(m.payload, from, text)) {
+                    from = cleanName(from);
+                    text = cleanChat(text);
+                    if (!text.empty()) chat.push_back("<" + from + "> " + text);
+                }
                 break;
             }
             case proto::MsgType::Error: {
                 std::string code, msg;
-                if (proto::parseError(m.payload, code, msg)) chat.push_back("! " + msg);
+                if (proto::parseError(m.payload, code, msg)) {
+                    chat.push_back("! " + proto::truncateUtf8(
+                                            proto::sanitizeText(msg, proto::kMaxChatBytes),
+                                            proto::kMaxChatBytes));
+                }
                 break;
             }
             default:
@@ -533,7 +618,7 @@ void clientWaitingRoom(Client& cli, GameUI& ui) {
         }
         if (k.key == Key::CtrlC || k.key == Key::Escape) return;
         if (k.isChar('/')) {
-            const std::string text = readLine("");
+            const std::string text = cleanChat(readLine(""));
             if (!text.empty()) cli.send(proto::MsgType::Chat, proto::makeChat(cli.name, text));
         }
     }
@@ -545,7 +630,8 @@ void runClientMatch(Client& cli, GameUI& ui) {
 
     while (cli.sock != net::kInvalidSocket) {
         // Wait for the next snapshot from the host.
-        while (!cli.haveView && cli.sock != net::kInvalidSocket) {            net::sleepMs(5);
+        while (!cli.haveView && cli.sock != net::kInvalidSocket) {
+            net::sleepMs(5);
             cli.pump();
             KeyEvent k;
             if (pollKey(30, k)) {
@@ -555,7 +641,7 @@ void runClientMatch(Client& cli, GameUI& ui) {
                     return;
                 }
                 if (k.isChar('/')) {
-                    const std::string text = readLine("");
+                    const std::string text = cleanChat(readLine(""));
                     if (!text.empty()) cli.send(proto::MsgType::Chat, proto::makeChat(cli.name, text));
                 }
             }
@@ -616,7 +702,8 @@ void hostOnlineGame(const AppConfig& cfg) {
     room.code = makeCode(room.rng);
     room.port = port;
     room.initSeats();
-    room.names[0] = cfg.playerName.empty() ? std::string("host") : cfg.playerName;
+    room.names[0] = cleanName(cfg.playerName);
+    if (room.names[0].empty()) room.names[0] = "host";
 
     if (!room.openPort(port)) {
         clearScreen();
@@ -639,11 +726,13 @@ void joinOnlineGame(const AppConfig& cfg) {
     const std::string host = cfg.joinHost.empty() ? askText("Host address: ", "127.0.0.1")
                                                    : cfg.joinHost;
     const uint16_t port = cfg.port ? cfg.port : askPort();
-    const std::string code = cfg.joinCode.empty() ? readLine("Room code: ") : cfg.joinCode;
-    const std::string name = cfg.playerName.empty()
-                                 ? askText(tr("common.enter_name"),
-                                           "player" + S(static_cast<int>(std::rand() % 900 + 100)))
-                                 : cfg.playerName;
+    const std::string code =
+        proto::sanitizeText(cfg.joinCode.empty() ? readLine("Room code: ") : cfg.joinCode, 16);
+    std::string name = cleanName(cfg.playerName.empty()
+                                     ? askText(tr("common.enter_name"),
+                                               "player" + S(static_cast<int>(std::rand() % 900 + 100)))
+                                     : cfg.playerName);
+    if (name.empty()) name = "player";
 
     Client cli;
     cli.name = name;

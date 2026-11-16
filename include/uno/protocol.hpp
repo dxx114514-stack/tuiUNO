@@ -1,6 +1,7 @@
 // Message framing and payload helpers. Frame = [u8 type][u32 length][payload].
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -12,6 +13,11 @@ namespace uno {
 namespace proto {
 
 inline constexpr uint32_t kProtocolVersion = 1;
+// A frame longer than this is treated as a protocol failure, not as "wait for
+// more bytes": otherwise a desynchronised stream can make us buffer 4 GB.
+inline constexpr uint32_t kMaxFramePayload = 1u << 20;
+inline constexpr size_t kMaxNameCodepoints = 16;
+inline constexpr size_t kMaxChatBytes = 200;
 
 enum class MsgType : uint8_t {
     // client -> host
@@ -45,9 +51,13 @@ class FrameDecoder {
   public:
     void feed(const std::string& bytes);
     bool next(Message& out);
+    // True after next() saw an impossible frame length. The caller must close
+    // the connection; there is no resynchronisation after a bad header.
+    bool failed() const { return failed_; }
 
   private:
     std::string buf_;
+    bool failed_ = false;
 };
 
 // --- payload builders / parsers --------------------------------------------
@@ -69,6 +79,24 @@ bool parseCreateRoom(const std::string& p, RoomConfig& cfg);
 
 std::string makeJoinRoom(const std::string& code, const std::string& name, uint8_t lang);
 bool parseJoinRoom(const std::string& p, std::string& code, std::string& name, uint8_t& lang);
+
+enum class JoinCheck {
+    Ok,
+    BadRoom,     // supplied room code does not match the host's
+    InProgress,  // the match has already started; seats are fixed
+};
+// Validates a join request. Keeping this pure makes the host's room-code gate
+// directly testable (the previous inline comparison shadowed Room::code and
+// therefore accepted every request).
+JoinCheck checkJoin(const std::string& expectedCode, const std::string& suppliedCode,
+                    bool started);
+
+// Removes C0 controls (including ESC, CR and LF) and DEL from untrusted text,
+// truncating to at most `maxCodepoints` UTF-8 code points. Malformed UTF-8 is
+// dropped rather than copied into the terminal.
+std::string sanitizeText(const std::string& in, size_t maxCodepoints);
+// Truncates to at most `maxBytes` bytes without splitting a UTF-8 code point.
+std::string truncateUtf8(const std::string& s, size_t maxBytes);
 
 std::string makeAction(const Action& a);
 bool parseAction(const std::string& p, Action& a);

@@ -14,7 +14,8 @@ namespace uno {
 
 enum class SessionResult {
     Completed,  // someone reached the target score
-    Aborted,    // the local user quit, or the host pulled the plug
+    Quit,       // a player left mid-match; the game was settled as a forfeit
+    Aborted,    // the host pulled the plug / the keep-going poll said stop
 };
 
 class MatchSession {

@@ -30,6 +30,28 @@ void Game::start() {
     resetRound();
 }
 
+void Game::forfeit(int player) {
+    if (matchOver_ || player < 0 || player >= rules_.playerCount) return;
+    // Keep the scores as they stand; only the ranking is decided now. The
+    // quitter goes last, everyone else is ordered by score (then hand size).
+    std::vector<int> order;
+    order.reserve(static_cast<size_t>(rules_.playerCount));
+    for (int p = 0; p < rules_.playerCount; ++p) {
+        if (p != player) order.push_back(p);
+    }
+    std::stable_sort(order.begin(), order.end(), [this](int a, int b) {
+        if (scores_[(size_t)a] != scores_[(size_t)b]) {
+            return scores_[(size_t)a] > scores_[(size_t)b];
+        }
+        return hands_[(size_t)a].size() < hands_[(size_t)b].size();
+    });
+    order.push_back(player);
+    rank_ = order;
+    matchOver_ = true;
+    phase_ = Phase::Over;
+    current_ = -1;
+}
+
 void Game::resetRound() {
     ++roundNo_;
     deck_.reset();

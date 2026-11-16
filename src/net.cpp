@@ -1,5 +1,6 @@
 #include "uno/net.hpp"
 
+#include <climits>
 #include <cstring>
 
 #if UNO_WIN
@@ -150,27 +151,65 @@ void closeSocket(Socket sock) {
 #endif
 }
 
-bool sendRaw(Socket sock, const char* data, size_t len) {
-    if (sock == kInvalidSocket || len == 0) return true;
+long long sendSome(Socket sock, const char* data, size_t len) {
+    if (sock == kInvalidSocket) return -1;
+    if (len == 0) return 0;
     RawSocket s = static_cast<RawSocket>(sock);
-    size_t sent = 0;
-    while (sent < len) {
-        const int n = ::send(s, data + sent, static_cast<int>(len - sent), 0);
-        if (n > 0) {
-            sent += static_cast<size_t>(n);
-            continue;
-        }
+    const size_t chunk = len > static_cast<size_t>(INT_MAX) ? static_cast<size_t>(INT_MAX) : len;
+    for (;;) {
+        const int n = ::send(s, data, static_cast<int>(chunk), 0);
+        if (n > 0) return static_cast<long long>(n);
 #if UNO_WIN
         const int e = ::WSAGetLastError();
-        if (e == WSAEWOULDBLOCK) break;
-        return false;
+        if (e == WSAEWOULDBLOCK) return 0;
+        if (e == WSAEINTR) continue;
+        return -1;
 #else
         if (errno == EINTR) continue;
-        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-        return false;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+        return -1;
 #endif
     }
-    return sent == len;
+}
+
+bool sendRaw(Socket sock, const char* data, size_t len) {
+    if (sock == kInvalidSocket) return false;
+    size_t sent = 0;
+    while (sent < len) {
+        const long long n = sendSome(sock, data + sent, len - sent);
+        if (n <= 0) return false;  // would-block or broken: never claim success
+        sent += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+bool OutBuf::push(const std::string& bytes) {
+    if (bytes.size() > limit_ - buf_.size()) return false;
+    buf_ += bytes;
+    return true;
+}
+
+bool OutBuf::flush(Socket sock) {
+    return flushWith([sock](const char* data, size_t len) {
+        return sendSome(sock, data, len);
+    });
+}
+
+bool OutBuf::flushWith(const std::function<long long(const char*, size_t)>& writer) {
+    while (!buf_.empty()) {
+        const long long n = writer(buf_.data(), buf_.size());
+        if (n < 0) {
+            buf_.clear();  // the stream is poisoned; the caller must close
+            return false;
+        }
+        if (n == 0) return true;  // socket buffer full, retry later
+        if (static_cast<size_t>(n) >= buf_.size()) {
+            buf_.clear();
+            return true;
+        }
+        buf_.erase(0, static_cast<size_t>(n));
+    }
+    return true;
 }
 
 bool recvRaw(Socket sock, std::string& buf, size_t maxBytes) {

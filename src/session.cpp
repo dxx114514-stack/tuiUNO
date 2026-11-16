@@ -56,7 +56,13 @@ SessionResult MatchSession::run(const UpdateSink& sink, const KeepGoing& keepGoi
         if (seat < static_cast<int>(connected_.size())) mine.players[(size_t)seat].connected = connected_[(size_t)seat];
         Action action = controllers_[(size_t)seat]->awaitAction(mine);
 
-        if (action.type == ActType::None) return SessionResult::Aborted;
+        if (action.type == ActType::None) {
+            // A human leaving is a forfeit, not an interruption: keep the
+            // scores earned so far and publish final standings.
+            game_.forfeit(seat);
+            broadcast(sink);
+            return SessionResult::Quit;
+        }
 
         game_.submit(seat, action);
         broadcast(sink);
